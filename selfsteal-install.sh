@@ -12,6 +12,7 @@
 #    bash selfsteal-install.sh --uninstall     # 卸载
 #    bash selfsteal-install.sh --media [URL]   # 拉取伪装站媒体库（GitHub Release，URL 可选）
 #    bash selfsteal-install.sh --media-gen     # 本地 ffmpeg 生成媒体库（低配机不推荐）
+#    bash selfsteal-install.sh --write-site    # 只重建伪装站页面（不动节点与证书）
 #    sest                                      # 访问统计控制台（菜单 11），私密访客页面见输出
 #    bash selfsteal-install.sh --domain a.com --email x@y.com   # 免交互安装
 #
@@ -298,6 +299,65 @@ step_collect_domain() {
     else
         ok "DNS 校验通过（指向本机）"
     fi
+}
+
+# 影像列表页链到 /video/<slug>.html。媒体文件由 --media 另放，页面必须随脚本生成。
+write_video_pages() {
+    mkdir -p "$SITE_ROOT/video"
+    local slug title date dur size blurb
+    while IFS='|' read -r slug title date dur size blurb; do
+        [[ -z $slug || $slug == \#* ]] && continue
+        cat > "$SITE_ROOT/video/${slug}.html" <<EOF_VPAGE
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="${blurb}">
+<title>${title} · 拾光小记</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/">拾光小记</a>
+    <nav>
+      <a href="/">首页</a>
+      <a href="/video.html" class="active">影像</a>
+      <a href="/wallpaper.html">壁纸</a>
+      <a href="/archive.html">随笔</a>
+      <a href="/about.html">关于</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+  <h1 class="page-title">${title}</h1>
+  <p class="page-sub">${date} · ${dur} · ${size} · 一次成片，没有剪辑。</p>
+  <video class="player" controls playsinline preload="metadata" poster="/media/thumb/${slug}.png">
+    <source src="/media/video/${slug}.mp4" type="video/mp4">
+  </video>
+  <p><a class="btn" href="/media/video/${slug}.mp4" download>下载原片</a></p>
+  <p>${blurb}</p>
+  <p class="back"><a href="/video.html">← 回影像</a></p>
+</main>
+<footer class="site-foot">
+  <div class="wrap">
+    <p>拾光小记 · 影像与随笔 · 2019-2026 · 站点放在一台小机器上，视频没套 CDN，加载慢请体谅。</p>
+  </div>
+</footer>
+</body>
+</html>
+EOF_VPAGE
+    done <<'VIDEOS'
+auto-xingxie|星屑 · 生命游戏|2026-11-12|3:00|100 MB|康威生命游戏跑了三分钟。活细胞是暖金，底是深蓝灰，从头放到尾，没有剪。
+auto-yuanbao|元胞 · 雨夜 110|2026-11-05|3:00|16 MB|110 号元胞机，调色偏冷。像雨夜里一块自己在长的玻璃。
+tushi-erhao|图样 · 色相漫游|2026-10-24|3:00|48 MB|测试图样把色相慢慢转了一圈。本来是对焦用的画面，转着转着倒像一组自己的片子。
+fenxing-piaoliu|分形漂流（九十秒）|2026-10-15|1:30|114 MB|曼德博集合往里漂了九十秒。这一支比别的短，文件反而最大，细节都堆在后半段。
+jianbian-zhiye|渐变之夜|2026-10-03|3:00|13 MB|螺旋渐变，从深蓝转到赭石再回到纸色。几乎没有形状，就是颜色在走。
+chenhun-xian|晨昏线|2026-09-24|3:00|11 MB|圆形渐变，暖金压在蓝灰上。名字取的是昼夜交界那一条线。
+VIDEOS
+    ok "影像播放页已生成: 6"
 }
 
 # =============================================================================
@@ -1109,7 +1169,8 @@ Allow: /
 Sitemap: https://${DOMAIN}/sitemap.xml
 EOF_ROBOTS
 
-    ok "网站已生成: 首页/影像/壁纸/随笔/关于/404"
+    write_video_pages
+    ok "网站已生成: 首页/影像播放页/壁纸/随笔/关于/404"
 
     echo 'ok' > "$SITE_ROOT/healthz"
     ok "健康检查文件: /healthz"
@@ -2529,6 +2590,7 @@ while [[ $# -gt 0 ]]; do
         --uninstall) do_uninstall; exit $? ;;
         --media)     step_fetch_media "${2:-}"; exit $? ;;
         --media-gen) step_gen_media_local; exit $? ;;
+        --write-site) step_write_site; exit $? ;;
         --domain)    DOMAIN=$2; ACTION=install; shift 2 ;;
         --email)     EMAIL=$2; shift 2 ;;
         *) err "未知参数: $1（用 --help 查看用法）"; exit 1 ;;
