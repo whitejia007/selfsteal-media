@@ -1849,7 +1849,47 @@ STATE_FILE=/etc/sing-box/state.env
 CRON_FILE=/etc/cron.d/selfsteal-visitors
 LOGDIR=/var/log/nginx
 
-c1() { printf "\033[36m%s\033[0m\n" "$*"; }
+if locale -a 2>/dev/null | grep -qiE '^C\.(utf-?8|UTF-8)$'; then
+    export LANG=C.UTF-8 LC_ALL=C.UTF-8
+fi
+
+c1() { printf "\033[36m  %s\033[0m\n" "$*"; }
+dim() { printf "\033[90m  %s\033[0m\n" "$*"; }
+
+# 终端列宽：ASCII 占 1 列，其余占 2 列
+dwidth() {
+    local s=$1 i c w=0 n=${#s}
+    for ((i=0; i<n; i++)); do
+        c=${s:i:1}
+        if [[ $c == [[:ascii:]] ]]; then w=$((w+1)); else w=$((w+2)); fi
+    done
+    printf '%s' "$w"
+}
+
+pad() {
+    local s=$1 width=$2 align=${3:-left} n gap
+    n=$(dwidth "$s")
+    gap=$((width - n))
+    (( gap < 0 )) && gap=0
+    if [[ $align == right ]]; then
+        printf '%*s%s' "$gap" '' "$s"
+    else
+        printf '%s%*s' "$s" "$gap" ''
+    fi
+}
+
+kv() { printf '  %s  %s\n' "$(pad "$1" 12)" "$2"; }
+
+fmt_nginx_ts() {
+    awk -v ts="$1" 'BEGIN{
+        m["Jan"]="01";m["Feb"]="02";m["Mar"]="03";m["Apr"]="04"
+        m["May"]="05";m["Jun"]="06";m["Jul"]="07";m["Aug"]="08"
+        m["Sep"]="09";m["Oct"]="10";m["Nov"]="11";m["Dec"]="12"
+        n=split(ts, a, /[\/: ]/)
+        if (n < 6 || m[a[2]] == "") { print ts; exit }
+        printf "%s-%s-%02d %s:%s:%s UTC\n", a[3], m[a[2]], a[1], a[4], a[5], a[6]
+    }'
+}
 
 get_domain() {
     [[ -f $STATE_FILE ]] && . "$STATE_FILE" 2>/dev/null
@@ -1998,35 +2038,43 @@ console() {
               [[ -f $f ]] || continue
               case $f in *.gz) zcat "$f" ;; *) cat "$f" ;; esac
           done 2>/dev/null)
-    [[ -z $ALL ]] && { echo "没有访问日志"; exit 0; }
+    [[ -z $ALL ]] && { echo "  没有访问日志"; exit 0; }
 
-    c1 "════════════════════════════════════════"
-    c1 "  伪装站访问统计（明细为最近 $DAYS 天，汇总为全量）"
-    c1 "════════════════════════════════════════"
-
-    REQ_TOTAL=$(wc -l <<<"$ALL")
+    local REQ_TOTAL FIRST_TS UNIQ_IP BYTES_MB MEDIA_MB FALLBACK_REQ TOKEN MEDIA_DIR_MB
+    REQ_TOTAL=$(awk 'END{print NR+0}' <<<"$ALL")
     FIRST_TS=$(head -1 <<<"$ALL" | awk -F'[][]' '{print $2}')
-    UNIQ_IP=$(awk '{print $1}' <<<"$ALL" | sort -u | wc -l)
+    FIRST_TS=$(fmt_nginx_ts "${FIRST_TS:-}")
+    UNIQ_IP=$(awk '{print $1}' <<<"$ALL" | sort -u | awk 'END{print NR+0}')
     BYTES_MB=$(awk '{s+=$10} END{printf "%.1f", s/1024/1024}' <<<"$ALL")
     MEDIA_MB=$(awk '$7 ~ /^\/media\// {s+=$10} END{printf "%.1f", s/1024/1024}' <<<"$ALL")
-    FALLBACK_REQ=$(awk '$1=="127.0.0.1"' <<<"$ALL" | wc -l)
-
-    echo "日志起点   : ${FIRST_TS:-未知}"
-    echo "总请求数   : $REQ_TOTAL 次"
-    echo "独立来源IP : $UNIQ_IP 个"
-    echo "总下行流量 : $BYTES_MB MB"
-    echo "其中媒体(/media/)下行: $MEDIA_MB MB"
-    echo "经 Reality 回落的请求 : $FALLBACK_REQ 次"
-
-    local TOKEN
+    FALLBACK_REQ=$(awk '$1=="127.0.0.1"{n++} END{print n+0}' <<<"$ALL")
+    MEDIA_DIR_MB=$(du -sm "$SITE_ROOT/media" 2>/dev/null | awk '{print $1}')
     [[ -f $TOKEN_FILE ]] && TOKEN=$(cat "$TOKEN_FILE")
-    if [[ -n $TOKEN ]]; then
-        echo "访客网页   : https://$(get_domain)/$TOKEN/（每10分钟自动刷新）"
-    fi
-    echo
 
-    c1 "—— 按天统计（最近 $DAYS 天）——"
-    printf "   %-12s %8s %8s %10s\n" 日期 请求 独立IP 下行MB
+    echo
+    c1 "站点访问统计"
+    dim "最近 ${DAYS} 天按天列出，上面的汇总是全部日志"
+    echo
+    kv "日志起点" "${FIRST_TS:-未知}"
+    kv "总请求" "$REQ_TOTAL"
+    kv "独立 IP" "$UNIQ_IP"
+    kv "总下行" "${BYTES_MB} MB"
+    kv "媒体下行" "${MEDIA_MB} MB"
+    kv "回落请求" "$FALLBACK_REQ"
+    kv "媒体库" "${MEDIA_DIR_MB:-0} MB"
+    if [[ -n $TOKEN ]]; then
+        kv "访客页面" "https://$(get_domain)/${TOKEN}/"
+    fi
+    printf '  %s  \033[90m%s\033[0m\n' "$(pad '' 12)" "访客页每 10 分钟刷新 · 媒体 256KB/s 每连接 · 总流量看服务商面板"
+
+    echo
+    c1 "按天"
+    printf '  %s  %s  %s  %s  %s\n' \
+        "$(pad '日期' 10)" \
+        "$(pad '请求' 6 right)" \
+        "$(pad 'IP' 6 right)" \
+        "$(pad '下行MB' 10 right)" \
+        "$(pad '媒体MB' 10 right)"
     awk '
 BEGIN{
     m["Jan"]="01";m["Feb"]="02";m["Mar"]="03";m["Apr"]="04";m["May"]="05";m["Jun"]="06"
@@ -2044,20 +2092,23 @@ END{
     for(d in req)
         printf "%s %d %d %.2f %.2f\n", d, req[d], ip[d], by[d]/1024/1024, md[d]/1024/1024
 }' <<<"$ALL" | sort -r | head -n "$DAYS" \
-    | awk '{printf "   %-12s %8d %8d %10.2f%s\n", $1, $2, $3, $4, ($5+0>0?" (媒体"$5"MB)":"")}'
-    echo
+    | awk '{printf "  %-10s  %6d  %6d  %10.2f  %10.2f\n", $1, $2, $3, $4, $5}'
 
-    c1 "—— 触碰节点的来源（sing-box 记录的 TLS 访客，最近 $DAYS 天 Top 15）——"
-    journalctl -u sing-box --since "-${DAYS}days" --no-pager 2>/dev/null \
+    local hits
+    hits=$(journalctl -u sing-box --since "-${DAYS}days" --no-pager 2>/dev/null \
       | grep 'REALITY' | grep -oE 'from [0-9.]+' | awk '{print $2}' \
       | sort | uniq -c | sort -rn | head -15 \
-      | awk '{printf "   %-20s %s 次\n", $2, $1}'
+      | awk '{printf "  %-15s  %6d\n", $2, $1}')
     echo
-
-    c1 "—— 参考数字 ——"
-    MEDIA_DIR_MB=$(du -sm "$SITE_ROOT/media" 2>/dev/null | awk '{print $1}')
-    echo "媒体库占用磁盘 : ${MEDIA_DIR_MB:-0} MB"
-    echo "媒体按 256KB/s/连接 限速；VPS 总进出流量以服务商面板为准"
+    c1 "触碰来源"
+    dim "sing-box 记下的 TLS 连接，最近 ${DAYS} 天，最多 15 个"
+    if [[ -n $hits ]]; then
+        printf '  %s  %s\n' "$(pad '来源 IP' 15)" "$(pad '次数' 6 right)"
+        printf '%s\n' "$hits"
+    else
+        echo "  暂无"
+    fi
+    echo
 }
 
 case "${1:-}" in
