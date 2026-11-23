@@ -13,6 +13,7 @@
 #    bash selfsteal-install.sh --media [URL]   # 拉取伪装站媒体库（GitHub Release，URL 可选）
 #    bash selfsteal-install.sh --media-gen     # 本地 ffmpeg 生成媒体库（低配机不推荐）
 #    bash selfsteal-install.sh --write-site    # 只重建伪装站页面（不动节点与证书）
+#    bash selfsteal-install.sh --update        # 拉取 GitHub 最新脚本并应用到当前节点
 #    sest                                      # 访问统计控制台（菜单 11），私密访客页面见输出
 #    bash selfsteal-install.sh --domain a.com --email x@y.com   # 免交互安装
 #
@@ -1736,6 +1737,7 @@ step_fetch_media() {
     fi
     rm -f "$TMP"
     [[ -s $MROOT/video/auto-xingxie.mp4 ]] || { err "包内缺少 media/video，请核对打包结构"; return 1; }
+    save_media_stamp "$URL"
     ok "媒体库就位，共 $(du -sm "$MROOT" | awk '{print $1}') MB"
 }
 
@@ -2558,27 +2560,200 @@ update_core() {
 }
 
 # =============================================================================
-#  卸载
+#  更新脚本（GitHub raw）并应用到当前节点：页面、媒体库、nginx、统计
+#  不改 UUID / Reality 密钥 / 域名 / 端口 / 落地凭据
+# =============================================================================
+SCRIPT_RAW_URL="https://raw.githubusercontent.com/whitejia007/selfsteal-media/main/selfsteal-install.sh"
+MEDIA_PACK_STAMP=/opt/selfsteal/media-pack.stamp
+
+media_remote_stamp() {
+    curl -fsSLI -L --max-time 30 "$1" 2>/dev/null | tr -d '\r' | tr '[:upper:]' '[:lower:]' | awk '
+        $1=="etag:"{e=$2}
+        $1=="content-length:"{n=$2}
+        END{ if (e=="" && n=="") exit 1; print e "|" n }
+    '
+}
+
+save_media_stamp() {
+    local stamp
+    stamp=$(media_remote_stamp "$1" || true)
+    [[ -n $stamp && $stamp != "|" ]] || return 0
+    mkdir -p /opt/selfsteal
+    printf '%s\n' "$stamp" > "$MEDIA_PACK_STAMP"
+    chmod 600 "$MEDIA_PACK_STAMP"
+}
+
+# 远程媒体包有变化才重新下载。失败时保留现有 media/
+refresh_media() {
+    local MROOT="$SITE_ROOT/media" URL stamp old="" TMP STAGE
+    [[ -s $MEDIA_PACK_URL_FILE ]] && URL=$(tr -d '\r\n' < "$MEDIA_PACK_URL_FILE")
+    [[ -z $URL ]] && URL=$DEFAULT_MEDIA_URL
+    mkdir -p /opt/selfsteal
+    printf '%s\n' "$URL" > "$MEDIA_PACK_URL_FILE"
+    chmod 600 "$MEDIA_PACK_URL_FILE"
+
+    stamp=$(media_remote_stamp "$URL" || true)
+    [[ -f $MEDIA_PACK_STAMP ]] && old=$(tr -d '\r\n' < "$MEDIA_PACK_STAMP")
+    if [[ -n $stamp && $stamp != "|" && $stamp == "$old" \
+          && -s $MROOT/video/auto-xingxie.mp4 && -s $MROOT/wallpaper/wp-12.png ]]; then
+        ok "媒体库已是最新"
+        return 0
+    fi
+
+    line; msg "更新伪装站媒体库"; line
+    TMP=$(mktemp /tmp/selfsteal-pack.XXXXXX)
+    STAGE=$(mktemp -d /tmp/selfsteal-media.XXXXXX)
+    if ! curl -fL --retry 3 --connect-timeout 20 -o "$TMP" "$URL"; then
+        rm -rf "$TMP" "$STAGE"
+        err "媒体库下载失败，保留现有文件"
+        return 1
+    fi
+    if ! tar -xzf "$TMP" -C "$STAGE" || [[ ! -s $STAGE/media/video/auto-xingxie.mp4 ]]; then
+        rm -rf "$TMP" "$STAGE"
+        err "媒体包无效，保留现有文件"
+        return 1
+    fi
+    rm -rf "$MROOT"
+    mv "$STAGE/media" "$MROOT"
+    rm -rf "$TMP" "$STAGE"
+    if [[ -n $stamp && $stamp != "|" ]]; then
+        printf '%s\n' "$stamp" > "$MEDIA_PACK_STAMP"
+        chmod 600 "$MEDIA_PACK_STAMP"
+    fi
+    ok "媒体库已更新，共 $(du -sm "$MROOT" | awk '{print $1}') MB"
+}
+
+apply_installed_updates() {
+    if ! is_installed; then
+        ok "脚本已就绪。当前还没有节点，用菜单 1 安装"
+        return 0
+    fi
+    load_state || { err "状态文件缺失，无法应用更新"; return 1; }
+
+    line; msg "应用脚本更新（链接、域名、端口、落地凭据不变）"; line
+    cp -a "$SB_CONF" "$SB_CONF.bak-update"
+
+    step_write_site
+    write_nginx_tls
+
+    if ! refresh_media; then
+        warn "媒体库未更新，继续应用其余变更"
+    fi
+
+    if ! write_singbox_config || ! "$SB_BIN" check -c "$SB_CONF"; then
+        cp -a "$SB_CONF.bak-update" "$SB_CONF"
+        err "新配置校验失败，已恢复原配置"
+        return 1
+    fi
+    systemctl restart sing-box
+    sleep 2
+    if ! systemctl is-active --quiet sing-box; then
+        cp -a "$SB_CONF.bak-update" "$SB_CONF"
+        systemctl restart sing-box
+        err "sing-box 启动失败，已恢复原配置"
+        return 1
+    fi
+    rm -f "$SB_CONF.bak-update"
+    save_state
+    if [[ -x /opt/selfsteal/selfsteal-stats.sh ]]; then
+        bash /opt/selfsteal/selfsteal-stats.sh --html >/dev/null 2>&1 || true
+    fi
+    ok "更新已应用"
+    show_link
+}
+
+# $1=menu 时，换过脚本后重新进入管理菜单
+update_script() {
+    local reopen=${1:-} tmp dest=/opt/selfsteal/selfsteal.sh
+    line; msg "更新脚本"; line
+    tmp=$(mktemp /tmp/selfsteal-install.XXXXXX)
+    msg "下载最新脚本..."
+    if ! curl -fL --retry 3 -H 'Cache-Control: no-cache' --connect-timeout 20 \
+            -o "$tmp" "$SCRIPT_RAW_URL"; then
+        rm -f "$tmp"
+        err "下载失败: $SCRIPT_RAW_URL"
+        return 1
+    fi
+    if ! grep -q 'selfsteal-install.sh' "$tmp" || ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "下载内容不是有效脚本，未替换"
+        return 1
+    fi
+    mkdir -p /opt/selfsteal /root
+    if cmp -s "$tmp" "$dest" 2>/dev/null; then
+        rm -f "$tmp"
+        ok "脚本已是 GitHub 最新版，继续同步页面和媒体库"
+        apply_installed_updates
+        return $?
+    fi
+    cp -f "$tmp" "$dest"
+    cp -f "$tmp" /root/selfsteal-install.sh
+    chmod +x "$dest" /root/selfsteal-install.sh
+    ln -sf "$dest" /usr/local/bin/se
+    ln -sf "$dest" /usr/local/bin/SE
+    rm -f "$tmp"
+    ok "脚本已替换，改用新版本继续"
+    if [[ $reopen == menu ]]; then
+        exec bash "$dest" --apply-update --reopen-menu
+    fi
+    exec bash "$dest" --apply-update
+}
+
+# =============================================================================
+#  卸载（回到安装脚本之前：服务、网站、证书、命令、本脚本装上的软件包）
 # =============================================================================
 do_uninstall() {
-    line; msg "卸载"; line
-    warn "将停止并删除 sing-box、nginx 站点配置、网站文件、systemd 服务"
-    confirm "确认卸载？证书与 nginx 软件包保留" || { msg "已取消"; return 0; }
+    local name
+    load_state 2>/dev/null || true
+    line; msg "完全卸载"; line
+    echo "  将删除："
+    echo "    · sing-box 程序、配置、服务和备份"
+    echo "    · 伪装站、媒体库、访问统计、se / sest 命令"
+    echo "    · 本机证书和续签钩子"
+    echo "    · nginx、certbot、jq 软件包"
+    echo "    · BBR 配置（拥塞控制恢复为 cubic）"
+    echo "    · /root/selfsteal-install.sh"
+    warn "客户端链接会失效。机器上若另有站点或证书，会一起清掉"
+    confirm "确认完全卸载？" || { msg "已取消"; return 0; }
 
-    systemctl stop sing-box 2>/dev/null
-    systemctl disable sing-box 2>/dev/null
-    rm -f "$SB_SVC"; systemctl daemon-reload
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
+    rm -f "$SB_SVC" /etc/systemd/system/multi-user.target.wants/sing-box.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed sing-box 2>/dev/null || true
 
-    # 两种 nginx 路径都清理，兼容历史安装位置
+    if command -v certbot >/dev/null 2>&1 && [[ -d /etc/letsencrypt/live ]]; then
+        for name in /etc/letsencrypt/live/*; do
+            [[ -d $name ]] || continue
+            name=$(basename "$name")
+            [[ $name == README ]] && continue
+            certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || true
+        done
+    fi
+    rm -rf /etc/letsencrypt /var/log/letsencrypt /var/lib/letsencrypt
+
     rm -f "$NGINX_LINK" "$NGINX_AVAIL" \
           /etc/nginx/conf.d/selfsteal.conf \
           /etc/nginx/sites-available/selfsteal \
-          /etc/nginx/sites-enabled/selfsteal
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+          /etc/nginx/sites-enabled/selfsteal \
+          /etc/cron.d/selfsteal-visitors \
+          /usr/local/bin/sing-box /usr/local/bin/se /usr/local/bin/SE /usr/local/bin/sest \
+          /root/selfsteal-install.sh
+    if [[ -f /etc/sysctl.d/99-selfsteal-bbr.conf ]]; then
+        rm -f /etc/sysctl.d/99-selfsteal-bbr.conf
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    fi
 
-    rm -rf "$SITE_ROOT" "$SB_CONF_DIR" "$SB_DIR" /usr/local/bin/sing-box
-    rm -rf /opt/selfsteal /usr/local/bin/se /usr/local/bin/SE
-    ok "已卸载（nginx/certbot 软件包与 /etc/letsencrypt 保留）"
+    rm -rf "$SITE_ROOT" "$ACME_ROOT" "$SB_CONF_DIR" "$SB_DIR" /opt/selfsteal
+
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y nginx nginx-common nginx-core certbot >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y jq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+    fi
+    ok "已完全卸载"
 }
 
 # =============================================================================
@@ -2606,9 +2781,10 @@ main_menu() {
         echo "  9) 卸载"
         echo "  10) 拉取伪装站媒体库（GitHub）"
         echo "  11) 站点访问统计"
+        echo "  12) 更新脚本（GitHub）"
         echo "  0) 退出"
         line
-        ask "请选择 [0-9]" "0"
+        ask "请选择 [0-12]" "0"
         case $REPLY in
             1) do_install; echo; read -r -p "按回车返回菜单..." _ ;;
             2) show_status; echo; read -r -p "按回车返回菜单..." _ ;;
@@ -2621,6 +2797,7 @@ main_menu() {
             9) do_uninstall; echo; read -r -p "按回车返回菜单..." _ ;;
             10) step_fetch_media; echo; read -r -p "按回车返回菜单..." _ ;;
             11) bash /opt/selfsteal/selfsteal-stats.sh 30; echo; read -r -p "按回车返回菜单..." _ ;;
+            12) update_script menu; echo; read -r -p "按回车返回菜单..." _ ;;
             0) exit 0 ;;
         esac
     done
@@ -2642,12 +2819,16 @@ load_state 2>/dev/null || true
 ensure_cli
 
 ACTION=""
+REOPEN_MENU=0
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --install)   ACTION=install ;;
+        --install)   ACTION=install; shift ;;
         --status)    show_status; exit $? ;;
         --link)      show_link; exit $? ;;
         --uninstall) do_uninstall; exit $? ;;
+        --update)    update_script; exit $? ;;
+        --apply-update) ACTION=apply; shift ;;
+        --reopen-menu) REOPEN_MENU=1; shift ;;
         --media)     step_fetch_media "${2:-}"; exit $? ;;
         --media-gen) step_gen_media_local; exit $? ;;
         --write-site) step_write_site; exit $? ;;
@@ -2656,6 +2837,14 @@ while [[ $# -gt 0 ]]; do
         *) err "未知参数: $1（用 --help 查看用法）"; exit 1 ;;
     esac
 done
+
+if [[ $ACTION == apply ]]; then
+    apply_installed_updates
+    if [[ $REOPEN_MENU == 1 ]]; then
+        main_menu
+    fi
+    exit 0
+fi
 
 # 无参数：新机器直接进安装向导（像 233boy 一样）；已安装则进管理菜单
 if [[ $ACTION == install ]]; then
