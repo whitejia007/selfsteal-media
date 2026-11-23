@@ -2114,7 +2114,16 @@ END{
 case "${1:-}" in
     --html) ensure_token; install_cron >/dev/null; gen_html ;;
     --cron) install_cron ;;
-    *)      ensure_token; install_cron >/dev/null; console "$@" ;;
+    *)
+        ensure_token
+        install_cron >/dev/null
+        # 定时任务最多 10 分钟才写出页面。菜单里先看到地址时，页面必须已经在。
+        _tok=$(cat "$TOKEN_FILE" 2>/dev/null || true)
+        if [[ -n $_tok && ! -s "$SITE_ROOT/$_tok/index.html" ]]; then
+            gen_html >/dev/null
+        fi
+        console "$@"
+        ;;
 esac
 
 STATSEOF
