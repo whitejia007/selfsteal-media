@@ -1223,10 +1223,25 @@ PYEOF
     fi
 }
 
+# 隐藏 nginx 版本号。已有未注释的 server_tokens off 则不动。
+ensure_nginx_server_tokens() {
+    local conf=/etc/nginx/nginx.conf
+    [[ -f $conf ]] || return 0
+    if grep -qE '^[[:space:]]*server_tokens[[:space:]]+off;' "$conf"; then
+        return 0
+    fi
+    if grep -qE '^[[:space:]]*#[[:space:]]*server_tokens[[:space:]]+off;' "$conf"; then
+        sed -i -E '0,/^[[:space:]]*#[[:space:]]*server_tokens[[:space:]]+off;/s//    server_tokens off;/' "$conf"
+    else
+        sed -i '/^http[[:space:]]*{/a\    server_tokens off;' "$conf"
+    fi
+}
+
 # =============================================================================
 #  步骤 5：nginx 先跑 80（给 ACME 验证用）
 # =============================================================================
 write_nginx_http() {
+    ensure_nginx_server_tokens
     mkdir -p "$(dirname "$NGINX_AVAIL")"
     cat > "$NGINX_AVAIL" <<NGINX
 # 由 selfsteal-install.sh 生成 —— HTTP 阶段（仅 ACME 验证 + 跳转）
@@ -1297,6 +1312,7 @@ HOOK
 #  步骤 7：nginx 切到 127.0.0.1:8443（HTTPS + http2 + TLS1.3）
 # =============================================================================
 write_nginx_tls() {
+    ensure_nginx_server_tokens
     cat > "$NGINX_AVAIL" <<NGINX
 # 由 selfsteal-install.sh 生成 —— HTTPS 阶段（仅回环监听，供 Reality 回落）
 server {
